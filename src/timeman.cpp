@@ -1,8 +1,6 @@
 /*
   Stockfish, a UCI chess playing engine derived from Glaurung 2.1
-  Copyright (C) 2004-2008 Tord Romstad (Glaurung author)
-  Copyright (C) 2008-2015 Marco Costalba, Joona Kiiski, Tord Romstad
-  Copyright (C) 2015-2017 Marco Costalba, Joona Kiiski, Gary Linscott, Tord Romstad
+  Copyright (C) 2004-2020 The Stockfish developers (see AUTHORS file)
 
   Stockfish is free software: you can redistribute it and/or modify
   it under the terms of the GNU General Public License as published by
@@ -19,101 +17,81 @@
 */
 
 #include <algorithm>
+#include <cfloat>
+#include <cmath>
 
-#include "montecarlo.h"
 #include "search.h"
 #include "timeman.h"
 #include "uci.h"
 
 TimeManagement Time; // Our global time management object
 
-namespace {
 
-  enum TimeType { OptimumTime, MaxTime };
+/// TimeManagement::init() is called at the beginning of the search and calculates
+/// the bounds of time allowed for the current game ply. We currently support:
+//      1) x basetime (+ z increment)
+//      2) x moves in y seconds (+ z increment)
 
-  int remaining(int myTime, int myInc, int moveOverhead, int movesToGo,
-                int moveNum, bool ponder, TimeType type) {
+void TimeManagement::init(Search::LimitsType& limits, Color us, int ply) {
 
-    if (myTime <= 0)
-        return 0;
+  TimePoint moveOverhead    = TimePoint(Options["Move Overhead"]);
+  TimePoint slowMover       = TimePoint(Options["Slow Mover"]);
+  TimePoint npmsec          = TimePoint(Options["nodestime"]);
 
-    double ratio; // Which ratio of myTime we are going to use
-
-    // Usage of increment follows quadratic distribution with the maximum at move 25
-    double inc = myInc * std::max(55.0, 120 - 0.12 * (moveNum - 25) * (moveNum - 25));
-
-    // In moves-to-go we distribute time according to a quadratic function with
-    // the maximum around move 20 for 40 moves in y time case.
-    if (movesToGo)
-    {
-        ratio = (type == OptimumTime ? 1.0 : 6.0) / std::min(50, movesToGo);
-
-        if (moveNum <= 40)
-            ratio *= 1.1 - 0.001 * (moveNum - 20) * (moveNum - 20);
-        else
-            ratio *= 1.5;
-
-        if (movesToGo > 1)
-            ratio = std::min(0.75, ratio);
-
-        ratio *= 1 + inc / (myTime * 8.5);
-    }
-    // Otherwise we increase usage of remaining time as the game goes on
-    else
-    {
-        double k = 1 + 20 * moveNum / (500.0 + moveNum);
-        ratio = (type == OptimumTime ? 0.017 : 0.07) * (k + inc / myTime);
-    }
-
-    if (USE_MONTE_CARLO)
-        ratio = 0.25 * ratio;
-
-    int time = int(std::min(1.0, ratio) * std::max(0, myTime - moveOverhead));
-
-    if (type == OptimumTime && ponder)
-        time = 5 * time / 4;
-
-    return time;
-  }
-
-} // namespace
-
-
-/// init() is called at the beginning of the search and calculates the allowed
-/// thinking time out of the time control and current game ply. We support four
-/// different kinds of time controls, passed in 'limits':
-///
-///  inc == 0 && movestogo == 0 means: x basetime  [sudden death!]
-///  inc == 0 && movestogo != 0 means: x moves in y minutes
-///  inc >  0 && movestogo == 0 means: x basetime + z increment
-///  inc >  0 && movestogo != 0 means: x moves in y minutes + z increment
-
-void TimeManagement::init(Search::LimitsType& limits, Color us, int ply)
-{
-  int moveOverhead = Options["Move Overhead"];
-  int npmsec       = Options["nodestime"];
-  bool ponder      = Options["Ponder"];
+  // optScale is a percentage of available time to use for the current move.
+  // maxScale is a multiplier applied to optimumTime.
+  double optScale, maxScale;
 
   // If we have to play in 'nodes as time' mode, then convert from time
   // to nodes, and use resulting values in time management formulas.
-  // WARNING: Given npms (nodes per millisecond) must be much lower then
-  // the real engine speed to avoid time losses.
+  // WARNING: to avoid time losses, the given npmsec (nodes per millisecond)
+  // must be much lower than the real engine speed.
   if (npmsec)
   {
       if (!availableNodes) // Only once at game start
           availableNodes = npmsec * limits.time[us]; // Time is in msec
 
-      // Convert from millisecs to nodes
-      limits.time[us] = (int)availableNodes;
+      // Convert from milliseconds to nodes
+      limits.time[us] = TimePoint(availableNodes);
       limits.inc[us] *= npmsec;
       limits.npmsec = npmsec;
   }
 
-  int moveNum = (ply + 1) / 2;
-
   startTime = limits.startTime;
-  optimumTime = remaining(limits.time[us], limits.inc[us], moveOverhead,
-                          limits.movestogo, moveNum, ponder, OptimumTime);
-  maximumTime = remaining(limits.time[us], limits.inc[us], moveOverhead,
-                          limits.movestogo, moveNum, ponder, MaxTime);
+
+  // Maximum move horizon of 50 moves
+  int mtg = limits.movestogo ? std::min(limits.movestogo, 50) : 50;
+
+  // Make sure timeLeft is > 0 since we may use it as a divisor
+  TimePoint timeLeft =  std::max(TimePoint(1),
+      limits.time[us] + limits.inc[us] * (mtg - 1) - moveOverhead * (2 + mtg));
+
+  // A user may scale time usage by setting UCI option "Slow Mover"
+  // Default is 100 and changing this value will probably lose elo.
+  timeLeft = slowMover * timeLeft / 100;
+
+  // x basetime (+ z increment)
+  // If there is a healthy increment, timeLeft can exceed actual available
+  // game time for the current move, so also cap to 20% of available game time.
+  if (limits.movestogo == 0)
+  {
+      optScale = std::min(0.008 + std::pow(ply + 3.0, 0.5) / 250.0,
+                           0.2 * limits.time[us] / double(timeLeft));
+      maxScale = std::min(7.0, 4.0 + ply / 12.0);
+  }
+
+  // x moves in y seconds (+ z increment)
+  else
+  {
+      optScale = std::min((0.8 + ply / 128.0) / mtg,
+                            0.8 * limits.time[us] / double(timeLeft));
+      maxScale = std::min(6.3, 1.5 + 0.11 * mtg);
+  }
+
+  // Never use more than 80% of the available time for this move
+  optimumTime = TimePoint(optScale * timeLeft);
+  maximumTime = TimePoint(std::min(0.8 * limits.time[us] - moveOverhead, maxScale * optimumTime));
+
+  if (Options["Ponder"])
+      optimumTime += optimumTime / 4;
 }
