@@ -376,16 +376,7 @@ void MainThread::search() {
       pauseExperience = true;
   }
   //from Khalid end
-  //livebook begin
-  if (Options["Live Book"] && Options["Live Book Contribute"] && !g_inBook)
-  {
-    char *szFen = curl_easy_escape(g_cURL, rootPos.fen().c_str(), 0);
-    std::string szURL = g_livebookURL + "?action=store" + "&board=" + szFen + "&move=move:" + UCI::move(bestThread->rootMoves[0].pv[0], rootPos.is_chess960());
-    curl_free(szFen);
-    curl_easy_setopt(g_cURL, CURLOPT_URL, szURL.c_str());
-    curl_easy_perform(g_cURL);
-  }
-  //livebook end
+
 }
 
 
