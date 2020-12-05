@@ -264,32 +264,23 @@ void MainThread::search() {
   else
   {
       Move bookMove = MOVE_NONE;
-      if(!Limits.infinite && !Limits.mate)
-      {
-	  bookMove = polybook.probe(rootPos);
-          if (!bookMove)
-              bookMove = polybook2.probe(rootPos);
-	  if(!bookMove)
-	  {
 
-	  }
+      if (!Limits.infinite && !Limits.mate)
+      {
+          bookMove = polybook.probe(rootPos);
+          if (!bookMove)          
+              bookMove = polybook2.probe(rootPos);
       }
+
       if (bookMove && std::count(rootMoves.begin(), rootMoves.end(), bookMove))
       {
-	  g_inBook = Options["Live Book Retry"];
-
-	  for (Thread* th : Threads)
-	    std::swap(th->rootMoves[0], *std::find(th->rootMoves.begin(), th->rootMoves.end(), bookMove));
+          for (Thread* th : Threads)
+              std::swap(th->rootMoves[0], *std::find(th->rootMoves.begin(), th->rootMoves.end(), bookMove));
       }
       else
       {
-	  bookMove = MOVE_NONE;
-	  g_inBook--;
-      }
-      if (!bookMove)
-      {
-	Threads.start_searching(); // start non-main threads
-	Thread::search();          // main thread start searching
+          Threads.start_searching(); // start non-main threads
+          Thread::search();          // main thread start searching
       }
   }
   //Books management end
