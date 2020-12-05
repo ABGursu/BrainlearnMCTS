@@ -23,16 +23,9 @@
 
 #include <unordered_map>
 
-#include "spinlock.h"
 #include "position.h"
 #include "thread.h"
 #include "types.h"
-
-// Global flag
-
-const bool USE_MONTE_CARLO = true;
-extern Depth mctsDepth;
-
 // The data structures for the Monte Carlo algorithm
 
 struct mctsNodeInfo;
@@ -50,15 +43,14 @@ public:
   MonteCarlo(Position& p);
 
   // The main function of the class
-  Move search();
+  void search();
 
   // The high-level description of the Monte-Carlo algorithm
   void create_root();
   bool computational_budget();
   mctsNode tree_policy();
   Reward playout_policy(mctsNode node);
-  void expanded();
-  void backup(mctsNode node, Reward r);
+  void backup(Reward r, bool AB_Mode);
   Edge* best_child(mctsNode node, EdgeStatistic statistic);
 
   // The UCB formula
@@ -76,11 +68,11 @@ public:
   Reward value_to_reward(Value v);
   Value reward_to_value(Reward r);
   Value evaluate_with_minimax(Depth d);
-  Value evaluate_with_minimax(Depth depth, mctsNode node);
+  Value evaluate_with_minimax(Depth d, mctsNode node);
   Reward evaluate_terminal();
-  Reward calculate_prior(Move m, int moveCount);
-  void add_prior_to_node(mctsNode node, Move m, Reward prior, int moveCount);
-  
+  Reward calculate_prior(Move m);
+  void add_prior_to_node(mctsNode node, Move m, Reward prior);
+
   // Tweaking the exploration algorithm
   void default_parameters();
   void set_exploration_constant(double C);
@@ -92,8 +84,8 @@ public:
 
   // Testing and debugging
   std::string params();
-  void debug_node(mctsNode node);
-  void debug_edge(Edge edge);
+  void debug_node();
+  void debug_edge();
   void debug_tree_stats();
   void test();
 
@@ -112,11 +104,11 @@ private:
   long            priorCnt;
   TimePoint       startTime;
   TimePoint       lastOutputTime;
-  bool AB_rollout;
   
   double max_epsilon = 0.99;
   double min_epsilon = 0.00;
   double decay_rate = 0.8;
+  bool AB_Rollout;
 
   // Flags and limits to tweak the algorithm
   long            MAX_DESCENTS;
@@ -145,30 +137,21 @@ struct Edge {
   Reward  prior;
   Reward  actionValue;
   Reward  meanActionValue;
-  Depth deep = 1;
 };
 
 // Comparison functions for edges
-struct {
+struct COMPARE_PRIOR {
   bool operator()(Edge a, Edge b) const
       { return a.prior > b.prior; }
-} ComparePrior;
+};
 
-struct {
-  bool operator()(Edge a, Edge b) const
-      { return (a.visits > b.visits) || (a.visits == b.visits && a.prior > b.prior); }
-} CompareVisits;
-
-struct {
-  bool operator()(Edge a, Edge b) const
-      { return a.meanActionValue > b.meanActionValue;}
-} CompareMeanAction;
-
-struct {
+struct COMPARE_ROBUST_CHOICE {
   bool operator()(Edge a, Edge b) const
       { return (10 * a.visits + a.prior > 10 * b.visits + b.prior); }
-} CompareRobustChoice;
+};
 
+extern COMPARE_PRIOR ComparePrior;
+extern COMPARE_ROBUST_CHOICE CompareRobustChoice;
 
 const int MAX_CHILDREN = 128;
 
@@ -177,19 +160,18 @@ struct mctsNodeInfo {
 public:
   Move  last_move()      { return lastMove; }
   Edge* children_list()  { return &(children[0]); }
-
+  Spinlock lock;
   // Data members
-  Spinlock lock;                        // A spin lock for parallelization
-  Key      key1            = 0;         // Zobrist hash of all pieces, including pawns
-  Key      key2            = 0;         // Zobrist hash of pawns
-  long     node_visits     = 0;         // number of visits by the Monte-Carlo algorithm
-  int      number_of_sons  = 0;         // total number of legal moves
-  int      expandedSons    = 0;         // number of sons expanded by the Monte-Carlo algorithm
-  Move     lastMove        = MOVE_NONE; // the move between the parent and this node
-  Edge     children[MAX_CHILDREN];
-  Move ABmove = MOVE_NONE;
-  Value ttValue = VALUE_NONE;
+  Key         key1            = 0;         // Zobrist hash of all pieces, including pawns
+  Key         key2            = 0;         // Zobrist hash of pawns
+  long        node_visits     = 0;         // number of visits by the Monte-Carlo algorithm
+  int         number_of_sons  = 0;         // total number of legal moves
+  int         expandedSons    = 0;         // number of sons expanded by the Monte-Carlo algorithm
+  Move        lastMove        = MOVE_NONE; // the move between the parent and this node
+  Edge        children[MAX_CHILDREN] = {};
   Depth deep = 1;
+  Value ttValue = VALUE_NONE;
+  bool AB = false;
 };
 
 
@@ -197,7 +179,5 @@ public:
 typedef std::unordered_multimap<Key, mctsNodeInfo> MCTSHashTable;
 mctsNode get_node(const Position& pos, bool createMode);
 extern MCTSHashTable MCTS;
-extern Spinlock createLock;
-
 
 #endif // #ifndef MONTECARLO_H_INCLUDED

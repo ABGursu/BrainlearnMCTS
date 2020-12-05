@@ -52,19 +52,21 @@
 using namespace std;
 using std::string;
 
-Spinlock createLock;
+COMPARE_PRIOR ComparePrior;
+COMPARE_ROBUST_CHOICE CompareRobustChoice;
 
   
 MCTSHashTable MCTS;
-Depth mctsDepth;
+
+
+Spinlock createLock;
 
 const Reward REWARD_NONE  = Reward(0.0);
 const Reward REWARD_MATED = Reward(0.0);
 const Reward REWARD_DRAW  = Reward(0.5);
 const Reward REWARD_MATE  = Reward(1.0);
 
-Edge EDGE_NONE = {MOVE_NONE, 0, REWARD_NONE, REWARD_NONE, REWARD_NONE, 1};
-
+Edge EDGE_NONE = {MOVE_NONE, 0, REWARD_NONE, REWARD_NONE, REWARD_NONE};
 
 /// get_node() probes the Monte-Carlo hash table to find the node with the given
 /// position, creating a new entry if it doesn't exist yet in the table.
@@ -100,9 +102,9 @@ mctsNode get_node(const Position& pos, bool createMode) {
    infos.number_of_sons   = 0;         // total number of legal moves
    infos.expandedSons     = 0;         // number of sons expanded by the Monte-Carlo algorithm
    infos.lastMove         = MOVE_NONE; // the move between the parent and this node
-   infos.ABmove = MOVE_NONE;
-   infos.ttValue = VALUE_NONE;
    infos.deep = 1;
+   infos.ttValue = VALUE_NONE;
+   infos.AB = false;
 
 //   debug << "inserting into the hash table: key = " << key1 << endl;
 
@@ -114,50 +116,50 @@ mctsNode get_node(const Position& pos, bool createMode) {
 Move move_of(mctsNode node) { return node->last_move(); }
 Edge* get_list_of_children(mctsNode node) { return node->children_list(); }
 int number_of_sons(mctsNode node) { return node->number_of_sons; }
+bool is_interrupted() { return Threads.stop.load(std::memory_order_relaxed); }
 
 
 // MonteCarlo::search() is the main function of Monte-Carlo algorithm.
-Move MonteCarlo::search() {
+void MonteCarlo::search() {
 
     create_root();
     while (computational_budget()) {
-		AB_rollout = false;
+       AB_Rollout = false;
        mctsNode node = tree_policy();
-	   Reward reward = REWARD_NONE;
-	   Value value;
-	   if(AB_rollout)
-	   {
-		   Depth deep = std::min(node->deep, mctsDepth);
-		   if(deep >= mctsDepth)
-			   std::min(node->deep, mctsDepth+20);
-		//   deep = std::min(node->deep, maximumPly);
-		   value = evaluate_with_minimax(deep, node);
+       Reward reward;
+       if(AB_Rollout)
+       {
+	       Value value = evaluate_with_minimax(std::min(node->deep, MAX_PLY-ply-2), node);
+
+	       if(value == VALUE_ZERO)
+	       {
+		       value = node->ttValue;
+	       }
+
+	       if(value >= VALUE_KNOWN_WIN)
+		       value = VALUE_KNOWN_WIN-node->deep-ply;
+	       if(value <= -VALUE_KNOWN_WIN)
+		       value = -(VALUE_KNOWN_WIN-node->deep-ply);
+	       reward = value_to_reward(value);
 		   node->lock.acquire();
-		   node->ttValue = value;
+	       node->ttValue = value;
 		   node->lock.release();
-		   reward = value_to_reward(value);
-	   }
-	   else
-		reward = playout_policy(node);
-	if(node->deep + ply > maximumPly)
-		maximumPly = node->deep + ply;
-		AB_rollout?backup(node, value_to_reward(value)):backup(node, reward);;
-       
+       }
+       else
+		reward= playout_policy(node);
+
+       backup(reward, AB_Rollout);
 
        if (should_output_result())
-           emit_principal_variation();	   
-	
+           emit_principal_variation();
     }
 
     emit_principal_variation();
-
-    return best_child(root, STAT_VISITS)->move;
 }
 
 
 /// MonteCarlo::MonteCarlo() is the constructor for the MonteCarlo class
 MonteCarlo::MonteCarlo(Position& p) : pos(p) {
-
     default_parameters();
     create_root();
 }
@@ -179,20 +181,20 @@ void MonteCarlo::create_root() {
     // Prepare the stack to go down and up in the game tree
     std::memset(stackBuffer, 0, sizeof(stackBuffer));
 	
-	for (int i = -7; i <= MAX_PLY + 10; i++)
-          stack[i].continuationHistory = &(pos.this_thread()->continuationHistory[0][0][NO_PIECE][0]); // Use as a sentinel
+    for (int i = -7; i <= MAX_PLY + 10; i++)
+      stack[i].continuationHistory = &(pos.this_thread()->continuationHistory[0][0][NO_PIECE][0]); // Use as a sentinel
 
     // TODO : what to do with killers ???
 
     // Erase the list of nodes, and set the current node to the root node
     std::memset(nodesBuffer, 0, sizeof(nodesBuffer));
-	mctsNode s = get_node(pos, false);
-			if(s == nullptr)
-			{
-				createLock.acquire();
-				s = get_node(pos, true);
-				createLock.release();
-			}			
+    mctsNode s = get_node(pos, false);
+    if(s == nullptr)
+    {
+		createLock.acquire();
+		s = get_node(pos, true);
+		createLock.release();
+    }
             
     root = nodes[ply] = s;
 	
@@ -214,8 +216,7 @@ bool MonteCarlo::computational_budget() {
     if (pos.this_thread() == Threads.main())
         static_cast<MainThread*>(pos.this_thread())->check_time();
 
-    return    (descentCnt < MAX_DESCENTS)
-           && !Threads.stop.load(std::memory_order_relaxed);
+    return (descentCnt < MAX_DESCENTS) && !is_interrupted();
 }
 
 
@@ -225,8 +226,6 @@ mctsNode MonteCarlo::tree_policy() {
 
     assert(is_root(current_node()));
     descentCnt++;
-	
-	int deep = 2;
 
     if (number_of_sons(root) == 0)
         return root;
@@ -235,40 +234,34 @@ mctsNode MonteCarlo::tree_policy() {
     {
         if (is_terminal(current_node()))
             return current_node();
-		if(!is_root(current_node())
-			&& current_node()->deep <= mctsDepth
-			)
+		int E_greedy = rand() % 100;
+		if (!is_root(current_node())
+			&& current_node()->ttValue < VALUE_KNOWN_WIN
+			&& current_node()->ttValue > -VALUE_KNOWN_WIN
+			&& number_of_sons(current_node()) > 5
+			&& E_greedy >= Options["Strategy"]
+		)
 		{
 			current_node()->lock.acquire();
-			current_node()->deep++;
+			current_node()->deep = std::min(current_node()->deep+1, MAX_PLY-ply-2);
 			current_node()->lock.release();
-			AB_rollout = true;
+			AB_Rollout = true;
 			return current_node();
+			
 		}
-		edges[ply] = best_child(current_node(), STAT_UCB);
-        Move m = edges[ply]->move;
 		
-		//Reward prior = value_to_reward(evaluate_with_minimax(maximumPly-ply)+2);
+		edges[ply] = best_child(current_node(), STAT_UCB);
+		
+        Move m = edges[ply]->move;
 
         Edge* edge = edges[ply];
-		
-		if(deep < current_node()->deep)
-			deep = current_node()->deep ;
-		
-		
-
-        current_node()->lock.acquire();
 
         current_node()->node_visits++;
+
         // Add a virtual loss to this edge (for load balancing in the parallel MCTS)
-		edge->prior;
         edge->visits          = edge->visits + 1.0;
         edge->actionValue     = edge->actionValue;
         edge->meanActionValue = edge->actionValue / edge->visits;
-		if(deep-ply > current_node()->deep)
-			current_node()->deep = deep-ply;
-
-        current_node()->lock.release();
 
        /* debug << "edges[" << ply << "].move = "
              << UCI::move(edges[ply]->move, pos.is_chess960())
@@ -286,7 +279,7 @@ mctsNode MonteCarlo::tree_policy() {
         mctsNode s = get_node(pos, false);
 			if(s == nullptr)
 			{
-				createLock.acquire();
+			  createLock.acquire();
 				s = get_node(pos, true);
 				createLock.release();
 			}			
@@ -317,81 +310,45 @@ Reward MonteCarlo::playout_policy(mctsNode node) {
     // We generate the legal moves and calculate their prior values.
 
     assert(current_node()->node_visits == 0);
-    mctsNode old = current_node();
 
-    generate_moves();
-
+	generate_moves();
     assert(current_node()->node_visits >= 1);
-    assert(current_node() == old);
 
     if (number_of_sons(node) == 0)
         return evaluate_terminal();
-	
-	//expanded();
+
     // Step 2. Play-out policy
     // Now implement a play-out policy from the newly expanded node
 
    // debug_tree_stats();
-    assert(current_node()->number_of_sons > 0);	
-	
+    assert(current_node()->number_of_sons > 0);
 
     // Step 3. Return reward
 
     // Return the reward of the play-out from the point of view of the side to play.
     // Here we can just return the prior value of the first legal moves, because the
     // legal moves were sorted by prior in the generate_moves() call.
-    return best_child(current_node(), STAT_VISITS)->prior;
-	
-//	return value_to_reward(evaluate_with_minimax(maximumPly-ply)+2);
-}
-void MonteCarlo::expanded()
-{
-	int counter = 0;
-	while(true)
-	{ 
-		mctsNode node = current_node();
-		Edge* edge = best_child(current_node(), STAT_UCB);
-		Edge* best = best_child(current_node(), STAT_PRIOR);
-		do_move(edge->move);
-		Value value = -evaluate_with_minimax(edge->deep);
-		undo_move();
-		current_node()->lock.acquire();
-		edge->prior = value_to_reward(value);
-		edge->deep++;
-		edge->visits++;
-		current_node()->lock.release();
-		if(edge->deep > 16)
-			break;
-		
-	}
-	for(int n = 0; n < number_of_sons(current_node()); n++)
-	{
-		current_node()->children[n].visits          = 0;
-	}
+
+    return get_list_of_children(current_node())[0].prior;
 }
 
 /// MonteCarlo::backup() implements the strategy for accumulating rewards up the tree
 /// after a playout.
-void MonteCarlo::backup(mctsNode node, Reward r) {
+void MonteCarlo::backup(Reward r, bool AB_Mode) {
 
   /* debug << "Entering backup()..." << endl;
    debug << pos << endl;
    debug << "reward r = " << r << endl;
    debug_tree_stats();
-   debug_node(current_node());
+   debug_node();
 */
-   assert(node == current_node());
+   //assert(node == current_node());
    assert(ply >= 1);
 
    double weight = 1.0;
-   double lr = 1.0;
-   double gamma = 1.0;
-   mctsNode nex_node = nullptr;
-   bool priorUpdate = false;
 
    while (!is_root(current_node()))
    {
-	   nex_node = current_node();
        undo_move();
 
        r = 1.0 - r;
@@ -401,28 +358,26 @@ void MonteCarlo::backup(mctsNode node, Reward r) {
      /*  debug << "stack[" << ply << "].currentMove = "
              << UCI::move(stack[ply].currentMove, pos.is_chess960())
              << std::endl;
-       debug_edge(*edge);
+       debug_edge();
 */
-       current_node()->lock.acquire();
 
+       if(AB_Mode)
+       {
+	       edge->prior = r;
+	       AB_Mode = false;
+       }
+
+	current_node()->lock.acquire();
        // Compensate the virtual loss we had set in tree_policy()
-	   if(!priorUpdate)
-	   {
-		   edge->prior = r;
-		   priorUpdate = true;
-	   }
        edge->visits = edge->visits - 1.0;
-	/*   if(number_of_sons(nex_node) > 0)
-	   {
-		   double next_state_max_prior = 1.0-best_child(nex_node, STAT_PRIOR)->prior;
-		   edge->prior = edge->prior*(1-lr) + lr*(gamma*next_state_max_prior);
-	   }
-	*/	   
+	   
+	   
        // Update the statistics of the edge
        edge->visits          = edge->visits + weight;
        edge->actionValue     = edge->actionValue + weight * r;
        edge->meanActionValue = edge->actionValue / edge->visits;
 
+current_node()->lock.release();
        assert(edge->meanActionValue >= 0.0);
        assert(edge->meanActionValue <= 1.0);
 
@@ -431,9 +386,7 @@ void MonteCarlo::backup(mctsNode node, Reward r) {
        // Propagate the minimax value up the tree instead of the playout value ?
        r = r * (1.0 - BACKUP_MINIMAX) + minimax * BACKUP_MINIMAX;
 
-       current_node()->lock.release();
-
-       //debug_edge(*edge);
+       //debug_edge();
 
        assert(stack[ply].currentMove == edge->move);
    }
@@ -461,16 +414,15 @@ Edge* MonteCarlo::best_child(mctsNode node, EdgeStatistic statistic) {
 
     Edge* children = get_list_of_children(node);
 
-    for (int k = 0 ; k < number_of_sons(node) ; k++)
-    {
-       /* debug << "move #" << k << ": "
-              << UCI::move(children[k].move, pos.is_chess960())
-              << " with " << children[k].visits
-              << (children[k].visits > 0 ? " visits":" visit")
-              << " and prior " << children[k].prior
-              << endl;
-			  */
-    }
+    //for (int k = 0 ; k < number_of_sons(node) ; k++)
+    //{
+    //   debug << "move #" << k << ": "
+    //          << UCI::move(children[k].move, pos.is_chess960())
+    //          << " with " << children[k].visits
+    //          << (children[k].visits > 0 ? " visits":" visit")
+    //          << " and prior " << children[k].prior
+    //          << endl;
+    //}
 
     int best = -1;
     double bestValue = -1000000000000.0;
@@ -499,6 +451,9 @@ Edge* MonteCarlo::best_child(mctsNode node, EdgeStatistic statistic) {
 
 /// MonteCarlo::should_output_result() checks if it should write the pv of the game tree
 bool MonteCarlo::should_output_result() {
+
+    if (pos.this_thread() != Threads.main())
+        return false;
 
     TimePoint elapsed = now() - startTime + 1;  // in milliseconds
     TimePoint outputDelay = now() - lastOutputTime;
@@ -530,7 +485,7 @@ void MonteCarlo::emit_principal_variation() {
     for (int k = 0; k < n; k++)
         list[k] = children[k];
 
-    std::sort(list, list + n, CompareRobustChoice);
+    std::sort(list, list + n, ComparePrior);
 
     // Clear the global list of moves for root (Search::RootMoves)
     Search::RootMoves& rootMoves = pos.this_thread()->rootMoves;
@@ -559,22 +514,65 @@ void MonteCarlo::emit_principal_variation() {
 			mctsNode s = get_node(pos, false);
 			if(s == nullptr)
 			{
-				createLock.acquire();
-				s = get_node(pos, true);
-				createLock.release();
+			  break;
 			}			
             nodes[ply] = s;
 
+			if(s->deep + ply > maximumPly)
+				maximumPly = s->deep + ply;
             if (  is_terminal(current_node())
                || number_of_sons(current_node()) <= 0
                || current_node()->node_visits <= 0)
                break;
 
             move = best_child(current_node(), STAT_VISITS)->move;
+			
+			Thread*  thread      = pos.this_thread();
+			Square   prevSq      = to_sq(stack[ply-1].currentMove);
+			Move     countermove = thread->counterMoves[pos.piece_on(prevSq)][prevSq];
+			Move     ttMove      = move;  // FIXME
+			Move*    killers     = stack[ply].killers;
+			Depth    depth       = 30;
 
-            if (pos.legal(move))
-                rootMoves[0].pv.push_back(move);
-        }
+			const CapturePieceToHistory* cph   = &thread->captureHistory;
+			const ButterflyHistory* mh         = &thread->mainHistory;
+			const PieceToHistory* contHist[] = { stack[ply-1].continuationHistory, stack[ply-2].continuationHistory,
+											  nullptr                   , stack[ply-4].continuationHistory,
+											  nullptr                   , stack[ply-6].continuationHistory };
+       
+			MovePicker mp(pos, ttMove, depth, mh,
+										  &thread->lowPlyHistory,
+										  cph,
+										  contHist,
+										  countermove,
+										  killers,
+										  ply);
+			Move legalMove;
+			int moveCount = 0;
+			bool trueMove = false;
+			// Generate the legal moves and calculate their priors
+	
+			while ((legalMove = mp.next_move()) != MOVE_NONE)
+				if (pos.legal(legalMove))
+				{
+					if(legalMove == move)
+					{
+						trueMove = true;
+						break;
+					}
+					if(moveCount > 4)
+						break;
+					moveCount++;
+				
+				}
+				
+				if(!trueMove)
+					break;
+			
+
+				if (pos.legal(move))
+					rootMoves[0].pv.push_back(move);
+			}
         for (int k = 0; k < cnt ; k++)
             undo_move();
 
@@ -634,7 +632,7 @@ bool MonteCarlo::is_terminal(mctsNode node) {
         return true;
 
     // Draw by repetition or draw by 50 moves rule?
-    if (pos.is_draw(ply - 1))
+    if (pos.is_draw(2))
         return true;
 
     return false;
@@ -676,7 +674,7 @@ void MonteCarlo::undo_move() {
 
 
 /// MonteCarlo::add_prior_to_node() adds the given (move,prior) pair as a new son for a node
-void MonteCarlo::add_prior_to_node(mctsNode node, Move m, Reward prior, int moveCount) {
+void MonteCarlo::add_prior_to_node(mctsNode node, Move m, Reward prior) {
 
    assert(node->number_of_sons < MAX_CHILDREN);
    assert(prior >= 0 && prior <= 1.0);
@@ -689,7 +687,6 @@ void MonteCarlo::add_prior_to_node(mctsNode node, Move m, Reward prior, int move
        node->children[n].prior           = prior;
        node->children[n].actionValue     = 0.0;
        node->children[n].meanActionValue = 0.0;
-	   node->children[n].deep = 1;
        node->number_of_sons++;
 
       /* debug << "Adding move #" << n << ": "
@@ -698,7 +695,7 @@ void MonteCarlo::add_prior_to_node(mctsNode node, Move m, Reward prior, int move
              << " and prior " << prior
              << endl;
 */
-       assert(node->number_of_sons == moveCount);
+       //assert(node->number_of_sons == moveCount);
    }
    else
    {
@@ -721,10 +718,9 @@ void MonteCarlo::generate_moves() {
     if (pos.should_debug())
        hit_any_key();
 
-    debug_node(current_node());
+    debug_node();
 */
-    current_node()->lock.acquire();
-
+current_node()->lock.acquire();
     if (current_node()->node_visits == 0)
     {
         Thread*  thread      = pos.this_thread();
@@ -743,7 +739,7 @@ void MonteCarlo::generate_moves() {
 
         //MovePicker mp(pos, ttMove, depth, mh, cph, contHist, countermove, killers);
 		
-		//MovePicker mp(pos, ttMove, depth, mh, cph, contHist, prevSq);
+	//MovePicker mp(pos, ttMove, depth, mh, cph, contHist, prevSq);
 		
 		MovePicker mp(pos, ttMove, depth, mh,
                                       &thread->lowPlyHistory,
@@ -755,17 +751,23 @@ void MonteCarlo::generate_moves() {
         Move move;
         Reward prior;
         int moveCount = 0;
-		
+
 
         // Generate the legal moves and calculate their priors
+	Reward bestPrior = REWARD_MATED;
         while ((move = mp.next_move()) != MOVE_NONE)
             if (pos.legal(move))
             {
                 stack[ply].moveCount = ++moveCount;
 								
-                prior = calculate_prior(move, moveCount);
+                prior = calculate_prior(move);
+		if(prior > bestPrior)
+		{
+			current_node()->ttValue = reward_to_value(prior);
+			bestPrior = prior;
+		}
 
-                add_prior_to_node(current_node(), move, prior, moveCount);
+                add_prior_to_node(current_node(), move, prior);
             }
 
         // Sort the moves according to their prior value
@@ -774,7 +776,6 @@ void MonteCarlo::generate_moves() {
         {
             Edge* children = get_list_of_children(current_node());
             std::sort(children, children + n, ComparePrior);
-			current_node()->ttValue = reward_to_value(get_list_of_children(current_node())[0].prior);
         }
 
         // Indicate that we have just expanded the current node
@@ -782,9 +783,7 @@ void MonteCarlo::generate_moves() {
         s->node_visits  = 1;
         s->expandedSons = 0;
     }
-
-    current_node()->lock.release();
-
+	current_node()->lock.release();
    // debug << "... exiting generate_moves()" << endl;
 }
 
@@ -825,20 +824,18 @@ Value MonteCarlo::evaluate_with_minimax(Depth depth) {
 */
     return v;
 }
-
-Value MonteCarlo::evaluate_with_minimax(Depth depth, mctsNode node) {
-
+Value MonteCarlo::evaluate_with_minimax(Depth d, mctsNode node)
+{
+	
     stack[ply].ply          = ply;
     stack[ply].currentMove  = MOVE_NONE;
     stack[ply].excludedMove = MOVE_NONE;
-		
-	Value delta = Value(18);
-	Value alpha = node->ttValue;	
-	Value beta =node->ttValue;
-	alpha = std::max(-VALUE_INFINITE, alpha-delta);
-	beta = std::min(VALUE_INFINITE,beta-delta);
+	
+    Value delta = Value(18);
+    Value alpha = std::max(node->ttValue-delta, -VALUE_INFINITE);
+    Value beta = std::min(node->ttValue+delta, VALUE_INFINITE);;
 
-    Value v = minimax_value(pos, &stack[ply], alpha, beta, depth);
+    Value v = minimax_value(pos, &stack[ply], d, alpha, beta);
 
     /*debug << pos << endl;
     debug << "minimax value = " << v << endl;
@@ -851,9 +848,9 @@ Value MonteCarlo::evaluate_with_minimax(Depth depth, mctsNode node) {
 /// the n-th son of the current node. Here we use the evaluation function to
 /// estimate this prior, we could use other strategies too (like the rank n of
 /// the son, or the type of the move (good capture/quiet/bad capture), etc).
-Reward MonteCarlo::calculate_prior(Move move, int n) {
+Reward MonteCarlo::calculate_prior(Move move) {
 
-    assert(n >= 0);
+    //assert(n >= 0);
 
     priorCnt++;
 
@@ -946,7 +943,7 @@ void MonteCarlo::debug_tree_stats() {
 
 
 /// MonteCarlo::debug_node()
-void MonteCarlo::debug_node(mctsNode node) {
+void MonteCarlo::debug_node() {
  /*  debug << "isCurrent    = " << (node == current_node()) << endl;
    debug << "isRoot       = " << is_root(current_node())  << endl;
    debug << "key1         = " << node->key1               << endl;
@@ -959,7 +956,7 @@ void MonteCarlo::debug_node(mctsNode node) {
 
 
 /// MonteCarlo::debug_edge()
-void MonteCarlo::debug_edge(Edge e) {
+void MonteCarlo::debug_edge() {
    /*debug << "edge = { "
          << UCI::move(e.move, pos.is_chess960())   << " , "
          << "N = " << e.visits                     << " , "
@@ -997,7 +994,7 @@ double MonteCarlo::UCB(mctsNode node, Edge& edge, bool priorMode) {
 
     double result = 0.0;
 
-    if (edge.visits)
+    if (edge.visits > Options["MinVisits"])
         result += edge.meanActionValue;
     else
         result += UCB_UNEXPANDED_NODE;
@@ -1023,9 +1020,9 @@ void MonteCarlo::default_parameters() {
    MAX_DESCENTS             = Search::Limits.depth ? Search::Limits.depth : 100000000000000;
    BACKUP_MINIMAX           = 1.0;
    PRIOR_FAST_EVAL_DEPTH    = 1;
-   PRIOR_SLOW_EVAL_DEPTH    = 2;
+   PRIOR_SLOW_EVAL_DEPTH    = 1;
    UCB_UNEXPANDED_NODE      = 1.0;
-   UCB_EXPLORATION_CONSTANT = 0.6;
+   UCB_EXPLORATION_CONSTANT = 1.0;
    UCB_LOSSES_AVOIDANCE     = 1.0;
    UCB_LOG_TERM_FACTOR      = 0.0;
    UCB_USE_FATHER_VISITS    = true;

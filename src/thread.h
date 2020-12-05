@@ -73,6 +73,7 @@ public:
   CapturePieceToHistory captureHistory;
   ContinuationHistory continuationHistory[2][2];
   Score contempt;
+  int failedHighCnt;
 };
 
 
@@ -126,5 +127,20 @@ private:
 };
 
 extern ThreadPool Threads;
+/// Spinlock class is a yielding spin-lock (compatible with hyperthreading machines)
+
+class Spinlock {
+  std::atomic_int lock;
+
+public:
+  Spinlock() { lock = 1; }                  // Init here to workaround a bug with MSVC 2013
+  Spinlock(const Spinlock&) { lock = 1; };
+  void acquire() {
+      while (lock.fetch_sub(1, std::memory_order_acquire) != 1)
+          while(lock.load(std::memory_order_relaxed) <= 0)
+              std::this_thread::yield();  // Be nice to hyperthreading
+  }
+  void release() { lock.store(1, std::memory_order_release); }
+};
 
 #endif // #ifndef THREAD_H_INCLUDED
